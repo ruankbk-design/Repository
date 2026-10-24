@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PW 1.8.7 - Scanner de Reliquias
 // @namespace    local.pw187.reliquias
-// @version      1.4.0
+// @version      1.5.0
 // @description  Lê inventário/banco/cartas, mantém histórico e aprende com notas locais.
 // @match        https://marketplace.theclassic.games/pw187*
 // @run-at       document-idle
@@ -31,6 +31,41 @@
   const MIN_PRICE = 40;
   const MAX_PRICE = 100;
   const CARD_NAMES = ['Althea', 'Kestra', 'Astrid', 'Lorelei', 'Saki', 'Tensa'];
+  const SAFE_MODE_KEY = `${PREFIX}_safe_mode`;
+  const LAST_NAV_KEY = `${PREFIX}_last_navigation`;
+  const NAV_COOLDOWN_MS = 8000;
+  const SCANNER_TAB_NAME = 'PW187ScannerSingleTab';
+
+  function safeModeEnabled() {
+    try { return localStorage.getItem(SAFE_MODE_KEY) !== 'off'; }
+    catch { return true; }
+  }
+
+  function detailUrl(value) {
+    try {
+      const url = new URL(value, location.href);
+      return url.protocol === 'https:' && url.hostname === 'marketplace.theclassic.games'
+        && /^\/pw187\/details\/\d+\/?$/.test(url.pathname) ? url : null;
+    } catch { return null; }
+  }
+
+  function navigateSafely(url, onMessage) {
+    if (safeModeEnabled()) {
+      let last = 0;
+      try { last = Number(localStorage.getItem(LAST_NAV_KEY)) || 0; } catch { /* Nada. */ }
+      const remaining = NAV_COOLDOWN_MS - (Date.now() - last);
+      if (remaining > 0) {
+        onMessage(`Aguarde ${Math.ceil(remaining / 1000)} s antes de abrir outro anúncio.`);
+        return;
+      }
+    }
+    const target = safeModeEnabled() ? SCANNER_TAB_NAME : '_blank';
+    const opened = window.open(url.href, target);
+    if (!opened) { onMessage('O Firefox bloqueou a abertura da aba. Confira a permissão de pop-ups.'); return; }
+    try { opened.opener = null; } catch { /* Nada. */ }
+    try { localStorage.setItem(LAST_NAV_KEY, String(Date.now())); } catch { /* Nada. */ }
+    onMessage(safeModeEnabled() ? 'Anúncio aberto na aba única do scanner.' : 'Anúncio aberto em nova aba.');
+  }
 
   function classify(price, totals) {
     const priceOk = price >= MIN_PRICE && price <= MAX_PRICE;
@@ -206,6 +241,8 @@
         .linkbox { display:flex; gap:5px; margin-top:10px; }
         .linkbox input { min-width:0; flex:1; background:#1e293b; color:white; border:1px solid #64748b;
           border-radius:6px; padding:7px; font:12px Arial,sans-serif; }
+        .safe { display:flex; align-items:center; gap:7px; margin-top:10px; }
+        .safe input { accent-color:#22c55e; width:16px; height:16px; }
         .notice { min-height:15px; margin-top:7px; }
         .overlay { position:fixed; inset:0; z-index:2147483641; display:grid; place-items:center;
           background:#000b; font:13px/1.45 Arial,sans-serif; color:#f9fafb; }
@@ -243,7 +280,8 @@
             <input id="targetUrl" type="url" placeholder="Cole o link de uma conta..." aria-label="Link de anúncio" />
             <button id="openUrl">Analisar</button>
           </div>
-          <div class="muted">O link abre uma aba que será analisada ao carregar. Não há varredura automática.</div>
+          <label class="safe"><input id="safeMode" type="checkbox" checked /> Modo seguro: aba única + intervalo de 8 s</label>
+          <div class="muted">Com o modo seguro ligado, links abertos pela rodinha a partir da lista reutilizam uma aba. Não há varredura automática.</div>
           <div class="muted notice" id="notice" role="status"></div>
         </div>
       </aside>
@@ -261,6 +299,12 @@
 
     const el = (id) => shadow.getElementById(id);
     const setText = (id, value) => { el(id).textContent = value; };
+    el('safeMode').checked = safeModeEnabled();
+    el('safeMode').addEventListener('change', () => {
+      try { localStorage.setItem(SAFE_MODE_KEY, el('safeMode').checked ? 'on' : 'off'); }
+      catch { /* Modo funciona na aba atual, mas pode não persistir. */ }
+      setText('notice', el('safeMode').checked ? 'Modo seguro ativado.' : 'Modo seguro desativado: novos cliques podem abrir várias abas.');
+    });
 
     function render() {
       const record = readRecord();
@@ -364,16 +408,12 @@
     el('rescan').addEventListener('click', render);
     el('openUrl').addEventListener('click', () => {
       const input = el('targetUrl');
-      let url;
-      try { url = new URL(input.value.trim()); }
-      catch { setText('notice', 'Cole um link completo, começando com https://.'); return; }
-      if (url.protocol !== 'https:' || url.hostname !== 'marketplace.theclassic.games'
-        || !/^\/pw187\/details\/\d+\/?$/.test(url.pathname)) {
+      const url = detailUrl(input.value.trim());
+      if (!url) {
         setText('notice', 'Use somente links de personagens do Marketplace PW 1.8.7.');
         return;
       }
-      window.open(url.href, '_blank', 'noopener');
-      setText('notice', 'Abertura solicitada. Se nada acontecer, confira o bloqueador de pop-ups.');
+      navigateSafely(url, (message) => setText('notice', message));
     });
     el('targetUrl').addEventListener('keydown', (event) => {
       if (event.key === 'Enter') { event.preventDefault(); el('openUrl').click(); }
@@ -419,6 +459,20 @@
       } catch { setText('notice', 'Cópia bloqueada pelo navegador.'); }
     });
     document.body.append(root);
+    function guardLink(event) {
+      const middleClick = event.type === 'auxclick' && event.button === 1;
+      const modifiedClick = event.type === 'click' && event.button === 0 && (event.ctrlKey || event.metaKey);
+      if (!middleClick && !modifiedClick) return;
+      if (!safeModeEnabled()) return;
+      const anchor = event.target instanceof Element ? event.target.closest('a[href]') : null;
+      const url = anchor ? detailUrl(anchor.href) : null;
+      if (!url) return;
+      event.preventDefault();
+      event.stopPropagation();
+      navigateSafely(url, (message) => setText('notice', message));
+    }
+    document.addEventListener('auxclick', guardLink, true);
+    document.addEventListener('click', guardLink, true);
     render();
   }
 
