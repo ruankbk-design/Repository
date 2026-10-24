@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PW 1.8.7 - Scanner de Reliquias
 // @namespace    local.pw187.reliquias
-// @version      1.6.0
+// @version      1.7.0
 // @description  Painel de céu, runas, cartas, arma e relíquias; histórico e notas locais.
 // @match        https://marketplace.theclassic.games/pw187*
 // @run-at       document-idle
@@ -13,7 +13,7 @@
 /*
  * Leitor LOCAL de paginas que voce mesmo abre.
  * Nao faz fetch, requests, navegacao automatica, cliques em anuncios ou compras.
- * Requisitos: 40 a 100 TCC e >=30 em pelo menos 2 das 3 reliquias,
+ * Requisitos: 40 a 100 TCC e >=30 em cada uma das 3 reliquias,
  * somando Inventario e Banco (e a aba Cartas, se houver reliquias la).
  * Atualizações vêm do arquivo público do repositório GitHub configurado acima.
  */
@@ -76,9 +76,9 @@
     const qualified = ITEMS.filter((i) => totals[i.key] >= MIN).length;
     return {
       qualified,
-      status: priceOk && qualified >= 2 ? 'pass' : 'fail',
+      status: priceOk && qualified === 3 ? 'pass' : 'fail',
       reason: !priceOk ? 'Preço fora de 40–100 TCC'
-        : qualified < 2 ? `Apenas ${qualified}/3 relíquias atingiram 30 unidades`
+        : qualified < 3 ? `Apenas ${qualified}/3 relíquias atingiram 30 unidades`
           : `${qualified}/3 relíquias atingiram 30 unidades`,
     };
   }
@@ -212,7 +212,7 @@
     try {
       const value = JSON.parse(localStorage.getItem(KEY) || '{}');
       if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
-      // Reclassifica contas salvas pela v1.0 usando a nova regra 2/3.
+      // Reclassifica resultados antigos usando a regra atual 3/3.
       for (const record of Object.values(value)) {
         if (typeof record?.price === 'number' && record.totals && ITEMS.every((i) => Number.isFinite(record.totals[i.key]))) {
           Object.assign(record, classify(record.price, record.totals));
@@ -280,6 +280,8 @@
         button { cursor:pointer; background:#253752; color:white; border:1px solid #425570;
           padding:8px 10px; border-radius:8px; font-weight:600; }
         button:hover { background:#395473; }
+        button.dangerButton { background:#451e2b; border-color:#9f3b4b; color:#fecaca; }
+        button.dangerButton:hover { background:#6c293b; }
         .identity { font-size:13px; font-weight:600; color:#e2e8f0; line-height:1.5; overflow-wrap:anywhere; }
         .status { margin:10px 0 14px; padding:10px; border-radius:9px; font-weight:bold; }
         .pass { color:#bbf7d0; background:#14532d; }
@@ -332,7 +334,7 @@
         [hidden] { display:none!important; }
       </style>
       <aside class="panel" aria-label="Scanner de Personagens">
-        <div class="head"><b>✦ PW Scanner <span class="version">v1.6</span></b><button id="toggle" title="Minimizar">−</button></div>
+        <div class="head"><b>✦ PW Scanner <span class="version">v1.7</span></b><button id="toggle" title="Minimizar">−</button></div>
         <div id="body">
           <div class="identity" id="identity"></div>
           <div id="status" class="status unknown">Analisando…</div>
@@ -358,7 +360,7 @@
             </section>
           </div>
           <details class="sectionDetails" open>
-            <summary>Relíquias · 30+ em pelo menos 2/3</summary>
+            <summary>Relíquias · 30+ em todas as 3/3</summary>
             <div id="items"></div>
             <div class="muted" id="sourceBreakdown"></div>
             <div class="muted" id="reason"></div>
@@ -382,7 +384,7 @@
       </aside>
       <div class="overlay" id="overlay" hidden>
         <section class="modal" role="dialog" aria-modal="true" aria-label="Histórico do scanner">
-          <div class="modalhead"><b>📋 Contas analisadas</b><button id="close">Fechar ✕</button></div>
+          <div class="modalhead"><b>📋 Contas analisadas</b><div class="actions"><button class="dangerButton" id="clearHistory">Apagar histórico</button><button id="close">Fechar ✕</button></div></div>
           <div class="muted">Sua nota de 1 a 5 mede o custo-benefício percebido. Ela não altera os critérios de classificação.</div>
           <div class="muted" id="learning"></div>
           <div class="columns">
@@ -554,6 +556,18 @@
       el('overlay').hidden = false;
     });
     el('close').addEventListener('click', () => { el('overlay').hidden = true; });
+    el('clearHistory').addEventListener('click', () => {
+      const count = Object.keys(getSaved()).length;
+      if (!count) { setText('learning', 'O histórico já está vazio.'); return; }
+      const confirmed = window.confirm(`Apagar definitivamente ${count} conta(s) analisada(s), incluindo as notas de 1 a 5? Esta ação não pode ser desfeita.`);
+      if (!confirmed) return;
+      try { localStorage.removeItem(KEY); }
+      catch { setText('learning', 'Não foi possível apagar os dados locais.'); return; }
+      renderHistory();
+      setText('saved', '0 contas verificadas · 0 aprovadas');
+      setText('prediction', '📊 Histórico apagado. Avalie novas contas para recalibrar o custo-benefício.');
+      setText('notice', 'Histórico e notas apagados. A conta aberta poderá ser registrada novamente ao reanalisar.');
+    });
     el('overlay').addEventListener('click', (event) => {
       if (event.target === el('overlay')) el('overlay').hidden = true;
     });
