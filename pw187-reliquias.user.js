@@ -1,0 +1,427 @@
+// ==UserScript==
+// @name         PW 1.8.7 - Scanner de Reliquias
+// @namespace    local.pw187.reliquias
+// @version      1.4.0
+// @description  Lê inventário/banco/cartas, mantém histórico e aprende com notas locais.
+// @match        https://marketplace.theclassic.games/pw187*
+// @run-at       document-idle
+// @grant        none
+// @updateURL    https://raw.githubusercontent.com/ruankbk-design/Repository/main/pw187-reliquias.user.js
+// @downloadURL  https://raw.githubusercontent.com/ruankbk-design/Repository/main/pw187-reliquias.user.js
+// ==/UserScript==
+
+/*
+ * Leitor LOCAL de paginas que voce mesmo abre.
+ * Nao faz fetch, requests, navegacao automatica, cliques em anuncios ou compras.
+ * Requisitos: 40 a 100 TCC e >=30 em pelo menos 2 das 3 reliquias,
+ * somando Inventario e Banco (e a aba Cartas, se houver reliquias la).
+ * Atualizações vêm do arquivo público do repositório GitHub configurado acima.
+ */
+(() => {
+  'use strict';
+
+  const PREFIX = 'pw187_relic_scan_v1';
+  const KEY = `${PREFIX}_results`;
+  const ITEMS = [
+    { key: 'arma', name: 'Relíquia Maravilha: Arma', id: 50410, icon: '⚔️' },
+    { key: 'armadura', name: 'Relíquia Maravilha: Armadura', id: 70020, icon: '🛡️' },
+    { key: 'artefato', name: 'Relíquia Maravilha: Artefato', id: 54687, icon: '💠' },
+  ];
+  const MIN = 30;
+  const MIN_PRICE = 40;
+  const MAX_PRICE = 100;
+  const CARD_NAMES = ['Althea', 'Kestra', 'Astrid', 'Lorelei', 'Saki', 'Tensa'];
+
+  function classify(price, totals) {
+    const priceOk = price >= MIN_PRICE && price <= MAX_PRICE;
+    const qualified = ITEMS.filter((i) => totals[i.key] >= MIN).length;
+    return {
+      qualified,
+      status: priceOk && qualified >= 2 ? 'pass' : 'fail',
+      reason: !priceOk ? 'Preço fora de 40–100 TCC'
+        : qualified < 2 ? `Apenas ${qualified}/3 relíquias atingiram 30 unidades`
+          : `${qualified}/3 relíquias atingiram 30 unidades`,
+    };
+  }
+
+  const normalize = (s) => String(s ?? '').normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '').trim().toLowerCase().replace(/\s+/g, ' ');
+
+  function readCards() {
+    const equippedContainer = document.querySelector('.pw187-equipped-cards');
+    const collection = document.querySelector('[data-pw187-panel="inventory"] [data-pw187-subpanel="cards"]');
+    if (!equippedContainer && !collection) return null;
+    const equipped = [...(equippedContainer?.querySelectorAll('.pw187-equipped-card.is-filled') || [])]
+      .map((node) => normalize(node.getAttribute('title') || node.querySelector('img')?.alt));
+    const stored = [...(collection?.querySelectorAll('li[data-item]') || [])].map((element) => {
+      try {
+        const item = JSON.parse(element.getAttribute('data-item'));
+        return normalize(item.item_name || item.name || item.title);
+      } catch { return ''; }
+    });
+    const equippedFound = CARD_NAMES.filter((name) => equipped.some((card) => card.startsWith(normalize(name))));
+    const found = CARD_NAMES.filter((name) => [...equipped, ...stored].some((card) => card.startsWith(normalize(name))));
+    return { found, count: found.length, complete: found.length === CARD_NAMES.length,
+      equippedCount: equippedFound.length, fromCollection: found.length > equippedFound.length };
+  }
+
+  function parsePrice() {
+    const source = document.querySelector('[data-character-price]')?.getAttribute('data-character-price')
+      || document.querySelector('.btn-price .price')?.textContent || '';
+    const match = source.match(/([\d.,]+)\s*TCC/i);
+    if (!match) return null;
+    const value = Number(match[1].replace(/\./g, '').replace(',', '.'));
+    return Number.isFinite(value) ? value : null;
+  }
+
+  function readContainers() {
+    const names = { bag: 'Inventário', bank: 'Banco', cards: 'Cartas' };
+    const totals = Object.fromEntries(ITEMS.map((i) => [i.key, 0]));
+    const byTab = {};
+    let invalid = 0;
+    let slots = 0;
+    for (const [tab, label] of Object.entries(names)) {
+      const container = document.querySelector(`[data-pw187-panel="inventory"] [data-pw187-subpanel="${tab}"]`);
+      if (!container) return { error: `A aba ${label} não foi encontrada no HTML.` };
+      const entries = [...container.querySelectorAll('li[data-item]')];
+      slots += entries.length;
+      byTab[tab] = Object.fromEntries(ITEMS.map((i) => [i.key, 0]));
+      for (const element of entries) {
+        let data;
+        try { data = JSON.parse(element.getAttribute('data-item')); }
+        catch { invalid++; continue; }
+
+        const name = normalize(data.item_name || data.name || data.title);
+        const id = Number(data.id);
+        const target = ITEMS.find((i) => id === i.id || name === normalize(i.name));
+        if (!target) continue;
+
+        const count = Number(data.count);
+        if (!Number.isSafeInteger(count) || count < 1) { invalid++; continue; }
+        totals[target.key] += count;
+        byTab[tab][target.key] += count;
+      }
+    }
+    if (invalid) return { error: `${invalid} item(ns) com dados inválidos. Conferir manualmente.` };
+    if (!slots) return { error: 'Nenhum item estruturado foi encontrado nas três abas.' };
+    return { totals, slots, byTab };
+  }
+
+  function readRecord() {
+    const id = location.pathname.match(/\/details\/(\d+)/)?.[1];
+    const price = parsePrice();
+    const bag = readContainers();
+    const name = document.querySelector('.item-manual__title')?.textContent?.trim()
+      || document.querySelector('[data-character-name]')?.getAttribute('data-character-name')?.trim()
+      || `Personagem ${id || '?'}`;
+    const cards = readCards();
+    if (!id || price === null || bag.error) {
+      return { id, name, price, cards, totals: bag.totals || null, status: 'unknown', reason: bag.error || 'ID ou preço não encontrado.' };
+    }
+    const decision = classify(price, bag.totals);
+    return {
+      id, name, price, cards, totals: bag.totals, slots: bag.slots, byTab: bag.byTab,
+      ...decision,
+      url: location.origin + location.pathname,
+      time: new Date().toISOString(),
+    };
+  }
+
+  function getSaved() {
+    try {
+      const value = JSON.parse(localStorage.getItem(KEY) || '{}');
+      if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+      // Reclassifica contas salvas pela v1.0 usando a nova regra 2/3.
+      for (const record of Object.values(value)) {
+        if (typeof record?.price === 'number' && record.totals && ITEMS.every((i) => Number.isFinite(record.totals[i.key]))) {
+          Object.assign(record, classify(record.price, record.totals));
+        }
+      }
+      return value;
+    } catch { return {}; }
+  }
+
+  function save(record) {
+    if (record.status === 'unknown') return;
+    try {
+      const records = getSaved();
+      records[record.id] = { ...records[record.id], ...record };
+      localStorage.setItem(KEY, JSON.stringify(records));
+    } catch { /* Painel continua útil mesmo sem armazenamento. */ }
+  }
+
+  function saveRating(id, rating) {
+    const records = getSaved();
+    if (!records[id]) return;
+    if (rating === null) delete records[id].rating;
+    else records[id].rating = rating;
+    localStorage.setItem(KEY, JSON.stringify(records));
+  }
+
+  // Estimativa simples por proximidade: nenhuma requisição externa e nenhum modelo remoto.
+  // Uma nota só tem peso em contas semelhantes em preço, relíquias e combo de cartas.
+  function estimate(record, records) {
+    if (!record.totals || typeof record.price !== 'number') return null;
+    const rated = records.filter((other) => other.id !== record.id &&
+      Number.isInteger(other.rating) && other.rating >= 1 && other.rating <= 5 &&
+      other.totals && typeof other.price === 'number');
+    if (rated.length < 2) return null;
+    const neighbors = rated.map((other) => {
+      const priceDistance = Math.abs(record.price - other.price) / 60;
+      const quantityDistance = ITEMS.reduce((sum, item) =>
+        sum + Math.abs(Math.min(record.totals[item.key], 100) - Math.min(other.totals[item.key], 100)) / 100, 0) / 3;
+      const cardDistance = record.cards && other.cards
+        ? Math.abs(record.cards.count - other.cards.count) / 6 : 0.3;
+      const weight = 1 / (0.25 + priceDistance + quantityDistance + 0.4 * cardDistance);
+      return { rating: other.rating, weight };
+    }).sort((a, b) => b.weight - a.weight).slice(0, 5);
+    const totalWeight = neighbors.reduce((s, n) => s + n.weight, 0);
+    return { value: neighbors.reduce((s, n) => s + n.rating * n.weight, 0) / totalWeight,
+      samples: rated.length };
+  }
+
+  function createPanel() {
+    const root = document.createElement('div');
+    root.id = 'pw187-reliquias-scanner';
+    const shadow = root.attachShadow({ mode: 'open' });
+    shadow.innerHTML = `
+      <style>
+        :host { all: initial; }
+        .panel { position: fixed; z-index: 2147483640; right: 18px; bottom: 18px;
+          width: 310px; max-width: calc(100vw - 36px); background: #111827; color: #f9fafb;
+          border: 1px solid #475569; border-radius: 12px; padding: 14px;
+          box-shadow: 0 12px 38px #0009; font: 13px/1.45 Arial,sans-serif; }
+        .head { display:flex; align-items:center; justify-content:space-between; margin-bottom:7px; gap:8px; }
+        .head b { font-size:15px; }
+        button { cursor:pointer; background:#334155; color:white; border:0; padding:7px 9px; border-radius:7px; }
+        button:hover { background:#475569; }
+        .status { margin:9px 0; padding:9px; border-radius:7px; font-weight:bold; }
+        .pass { color:#bbf7d0; background:#14532d; }
+        .fail { color:#fecaca; background:#7f1d1d; }
+        .unknown { color:#fde68a; background:#78350f; }
+        .item { display:flex; justify-content:space-between; margin:7px 0; gap:10px; }
+        .ok { color:#86efac; } .bad { color:#fca5a5; }
+        .muted { color:#cbd5e1; font-size:12px; }
+        .actions { display:flex; gap:6px; flex-wrap:wrap; margin-top:12px; }
+        .linkbox { display:flex; gap:5px; margin-top:10px; }
+        .linkbox input { min-width:0; flex:1; background:#1e293b; color:white; border:1px solid #64748b;
+          border-radius:6px; padding:7px; font:12px Arial,sans-serif; }
+        .notice { min-height:15px; margin-top:7px; }
+        .overlay { position:fixed; inset:0; z-index:2147483641; display:grid; place-items:center;
+          background:#000b; font:13px/1.45 Arial,sans-serif; color:#f9fafb; }
+        .modal { width:min(920px,94vw); max-height:88vh; overflow:auto; background:#0f172a;
+          border:1px solid #64748b; border-radius:13px; padding:18px; box-shadow:0 20px 55px #000b; }
+        .modalhead { display:flex; gap:10px; align-items:center; justify-content:space-between; position:sticky;
+          top:-18px; background:#0f172a; padding:8px 0; }
+        .modalhead b { font-size:18px; }
+        .columns { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+        .column { min-width:0; border:1px solid #334155; border-radius:9px; padding:10px; }
+        .entry { border-top:1px solid #334155; padding:10px 0; }
+        .entry a { color:#93c5fd; font-weight:bold; overflow-wrap:anywhere; }
+        .entry select { background:#1e293b; color:white; border:1px solid #64748b; border-radius:5px; padding:5px; }
+        .rating { display:flex; justify-content:space-between; align-items:center; gap:8px; margin-top:6px; }
+        @media(max-width:670px) { .columns { grid-template-columns:1fr; } }
+        [hidden] { display:none!important; }
+      </style>
+      <aside class="panel" aria-label="Scanner de Relíquias">
+        <div class="head"><b>🔎 PW Scanner</b><button id="toggle" title="Minimizar">−</button></div>
+        <div id="body">
+          <div class="muted" id="identity"></div>
+          <div id="status" class="status unknown">Analisando…</div>
+          <div id="items"></div>
+          <div class="muted" id="sourceBreakdown"></div>
+          <div class="muted" id="cards"></div>
+          <div class="muted" id="reason"></div>
+          <div class="muted" id="prediction"></div>
+          <div class="muted" id="saved"></div>
+          <div class="actions">
+            <button id="rescan">Reanalisar</button>
+            <button id="history">📋 Histórico e notas</button>
+            <button id="copy">Copiar aprovadas</button>
+          </div>
+          <div class="linkbox">
+            <input id="targetUrl" type="url" placeholder="Cole o link de uma conta..." aria-label="Link de anúncio" />
+            <button id="openUrl">Analisar</button>
+          </div>
+          <div class="muted">O link abre uma aba que será analisada ao carregar. Não há varredura automática.</div>
+          <div class="muted notice" id="notice" role="status"></div>
+        </div>
+      </aside>
+      <div class="overlay" id="overlay" hidden>
+        <section class="modal" role="dialog" aria-modal="true" aria-label="Histórico do scanner">
+          <div class="modalhead"><b>📋 Contas analisadas</b><button id="close">Fechar ✕</button></div>
+          <div class="muted">Sua nota de 1 a 5 mede o custo-benefício percebido. Ela não altera os critérios de classificação.</div>
+          <div class="muted" id="learning"></div>
+          <div class="columns">
+            <section class="column"><h3>✅ Classificadas (<span id="passedCount">0</span>)</h3><div id="passedList"></div></section>
+            <section class="column"><h3>❌ Desclassificadas (<span id="failedCount">0</span>)</h3><div id="failedList"></div></section>
+          </div>
+        </section>
+      </div>`;
+
+    const el = (id) => shadow.getElementById(id);
+    const setText = (id, value) => { el(id).textContent = value; };
+
+    function render() {
+      const record = readRecord();
+      save(record);
+      setText('identity', `${record.name} · ID ${record.id || '?'} · ${record.price === null ? 'Preço desconhecido' : `${record.price} TCC`}`);
+      const status = el('status');
+      status.className = `status ${record.status}`;
+      status.textContent = record.status === 'pass' ? `✅ APROVADA (${record.qualified}/3)` : record.status === 'fail' ? `❌ REPROVADA (${record.qualified ?? '?'}/3)` : '⚠️ NÃO FOI POSSÍVEL CONFIRMAR';
+      const items = el('items');
+      items.replaceChildren();
+      for (const item of ITEMS) {
+        const count = record.totals?.[item.key];
+        const line = document.createElement('div');
+        line.className = 'item';
+        const label = document.createElement('span');
+        label.textContent = `${item.icon} ${item.name.replace('Relíquia Maravilha: ', '')}`;
+        const amount = document.createElement('b');
+        amount.className = count >= MIN ? 'ok' : 'bad';
+        amount.textContent = `${count ?? '?'} / ${MIN}`;
+        line.append(label, amount);
+        items.append(line);
+      }
+      const sources = record.byTab;
+      setText('sourceBreakdown', sources
+        ? `Origem: Inventário (${ITEMS.map((i) => sources.bag[i.key]).join('/')}) · Banco (${ITEMS.map((i) => sources.bank[i.key]).join('/')}) · Cartas (${ITEMS.map((i) => sources.cards[i.key]).join('/')}) — ordem Arma/Armadura/Artefato`
+        : 'Origem: não disponível para esta análise');
+      setText('cards', record.cards ? `🃏 Cartas encontradas: ${record.cards.count}/6 (${record.cards.equippedCount}/6 equipadas)${record.cards.complete ? ' — COMBO DISPONÍVEL!' : ''} (${record.cards.found.join(', ') || 'nenhuma'})` : '🃏 Cartas não identificadas');
+      setText('reason', record.reason);
+      const values = Object.values(getSaved());
+      setText('saved', `${values.length} conta(s) verificadas · ${values.filter((v) => v.status === 'pass').length} aprovada(s)`);
+      const estimated = estimate(record, values);
+      setText('prediction', estimated ? `📊 Custo-benefício estimado: ${estimated.value.toFixed(1)}/5 (${estimated.samples} avaliações suas)` : '📊 Dê notas a pelo menos 2 outras contas para estimar custo-benefício.');
+      if (!el('overlay').hidden) renderHistory();
+    }
+
+    function makeEntry(record, all) {
+      const item = document.createElement('article');
+      item.className = 'entry';
+      const link = document.createElement('a');
+      link.href = record.url || `${location.origin}/pw187/details/${encodeURIComponent(record.id)}`;
+      link.target = '_blank';
+      link.rel = 'noopener noreferrer';
+      link.textContent = `${record.name || `Personagem ${record.id}`} (ID ${record.id})`;
+      item.append(link);
+
+      const details = document.createElement('div');
+      details.className = 'muted';
+      const t = record.totals || {};
+      details.textContent = `${record.price} TCC · Arma ${t.arma ?? '?'} · Armadura ${t.armadura ?? '?'} · Artefato ${t.artefato ?? '?'} · Cartas ${record.cards ? `${record.cards.count}/6` : '?'}`;
+      item.append(details);
+
+      const predicted = estimate(record, all);
+      if (predicted) {
+        const estimateLabel = document.createElement('div');
+        estimateLabel.className = 'muted';
+        estimateLabel.textContent = `Custo-benefício estimado: ${predicted.value.toFixed(1)}/5 (${predicted.samples} notas)`;
+        item.append(estimateLabel);
+      }
+      const ratingRow = document.createElement('div');
+      ratingRow.className = 'rating';
+      const label = document.createElement('span');
+      label.textContent = 'Sua nota:';
+      const select = document.createElement('select');
+      select.setAttribute('aria-label', `Sua nota para ${record.name || record.id}`);
+      select.dataset.id = record.id;
+      for (const [value, title] of [['', 'Sem nota'], ['1', '1 — Péssimo'], ['2', '2 — Ruim'], ['3', '3 — Regular'], ['4', '4 — Bom'], ['5', '5 — Excelente']]) {
+        const option = document.createElement('option');
+        option.value = value;
+        option.textContent = title;
+        select.append(option);
+      }
+      select.value = record.rating ? String(record.rating) : '';
+      ratingRow.append(label, select);
+      item.append(ratingRow);
+      return item;
+    }
+
+    function renderHistory() {
+      const records = Object.values(getSaved()).filter((r) => r.status === 'pass' || r.status === 'fail');
+      const ratedCount = records.filter((r) => Number.isInteger(r.rating) && r.rating >= 1 && r.rating <= 5).length;
+      setText('learning', `${ratedCount} conta(s) avaliadas. A estimativa compara preço, quantidade de relíquias e combo de cartas; é apenas uma referência.`);
+      for (const [status, countId, listId] of [
+        ['pass', 'passedCount', 'passedList'], ['fail', 'failedCount', 'failedList'],
+      ]) {
+        const chosen = records.filter((r) => r.status === status)
+          .sort((a, b) => (b.time || '').localeCompare(a.time || ''));
+        setText(countId, String(chosen.length));
+        const list = el(listId);
+        list.replaceChildren();
+        if (!chosen.length) {
+          const empty = document.createElement('div');
+          empty.className = 'muted';
+          empty.textContent = 'Nenhuma conta nesta categoria ainda.';
+          list.append(empty);
+        } else {
+          for (const record of chosen) list.append(makeEntry(record, records));
+        }
+      }
+    }
+
+    el('rescan').addEventListener('click', render);
+    el('openUrl').addEventListener('click', () => {
+      const input = el('targetUrl');
+      let url;
+      try { url = new URL(input.value.trim()); }
+      catch { setText('notice', 'Cole um link completo, começando com https://.'); return; }
+      if (url.protocol !== 'https:' || url.hostname !== 'marketplace.theclassic.games'
+        || !/^\/pw187\/details\/\d+\/?$/.test(url.pathname)) {
+        setText('notice', 'Use somente links de personagens do Marketplace PW 1.8.7.');
+        return;
+      }
+      window.open(url.href, '_blank', 'noopener');
+      setText('notice', 'Abertura solicitada. Se nada acontecer, confira o bloqueador de pop-ups.');
+    });
+    el('targetUrl').addEventListener('keydown', (event) => {
+      if (event.key === 'Enter') { event.preventDefault(); el('openUrl').click(); }
+    });
+    el('history').addEventListener('click', () => {
+      renderHistory();
+      el('overlay').hidden = false;
+    });
+    el('close').addEventListener('click', () => { el('overlay').hidden = true; });
+    el('overlay').addEventListener('click', (event) => {
+      if (event.target === el('overlay')) el('overlay').hidden = true;
+    });
+    el('overlay').addEventListener('change', (event) => {
+      const id = event.target?.dataset?.id;
+      if (!id) return;
+      const value = event.target.value;
+      saveRating(id, value ? Number(value) : null);
+      renderHistory();
+      const current = readRecord();
+      const predicted = estimate(current, Object.values(getSaved()));
+      setText('prediction', predicted ? `📊 Custo-benefício estimado: ${predicted.value.toFixed(1)}/5 (${predicted.samples} avaliações suas)` : '📊 Dê notas a pelo menos 2 outras contas para estimar custo-benefício.');
+    });
+    window.addEventListener('storage', (event) => {
+      if (event.key === KEY) {
+        const records = Object.values(getSaved());
+        setText('saved', `${records.length} conta(s) verificadas · ${records.filter((r) => r.status === 'pass').length} aprovada(s)`);
+        if (!el('overlay').hidden) renderHistory();
+      }
+    });
+    el('toggle').addEventListener('click', () => {
+      const body = el('body');
+      body.hidden = !body.hidden;
+      el('toggle').textContent = body.hidden ? '+' : '−';
+    });
+    el('copy').addEventListener('click', async () => {
+      const lines = Object.values(getSaved()).filter((v) => v.status === 'pass')
+        .sort((a, b) => a.price - b.price)
+        .map((v) => `${v.name || v.id} | ${v.price} TCC | Arma ${v.totals.arma} | Armadura ${v.totals.armadura} | Artefato ${v.totals.artefato} | Cartas ${v.cards?.count ?? '?'}/6 | ${v.url}`);
+      if (!lines.length) { setText('notice', 'Nenhuma conta aprovada ainda.'); return; }
+      try {
+        await navigator.clipboard.writeText(lines.join('\n'));
+        setText('notice', `${lines.length} link(s) copiado(s).`);
+      } catch { setText('notice', 'Cópia bloqueada pelo navegador.'); }
+    });
+    document.body.append(root);
+    render();
+  }
+
+  if (document.body) createPanel();
+  else addEventListener('DOMContentLoaded', createPanel, { once: true });
+})();
