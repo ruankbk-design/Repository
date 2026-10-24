@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         PW 1.8.7 - Scanner de Reliquias
 // @namespace    local.pw187.reliquias
-// @version      1.5.0
-// @description  Lê inventário/banco/cartas, mantém histórico e aprende com notas locais.
+// @version      1.6.0
+// @description  Painel de céu, runas, cartas, arma e relíquias; histórico e notas locais.
 // @match        https://marketplace.theclassic.games/pw187*
 // @run-at       document-idle
 // @grant        none
@@ -30,7 +30,11 @@
   const MIN = 30;
   const MIN_PRICE = 40;
   const MAX_PRICE = 100;
-  const CARD_NAMES = ['Althea', 'Kestra', 'Astrid', 'Lorelei', 'Saki', 'Tensa'];
+  const CARD_GROUPS = [
+    { label: 'Combo 1', names: ['Althea', 'Kestra', 'Lorelei', 'Astrid', 'Tensa', 'Saki'] },
+    { label: 'Combo 2', names: ['Imperador Locen', 'Senhora da Noite', 'Gorath', 'Asa Espectral', 'Imperador Chigo', 'Imperador Aohe'] },
+  ];
+  const CARD_NAMES = CARD_GROUPS.flatMap((group) => group.names);
   const SAFE_MODE_KEY = `${PREFIX}_safe_mode`;
   const LAST_NAV_KEY = `${PREFIX}_last_navigation`;
   const NAV_COOLDOWN_MS = 8000;
@@ -82,6 +86,41 @@
   const normalize = (s) => String(s ?? '').normalize('NFD')
     .replace(/[\u0300-\u036f]/g, '').trim().toLowerCase().replace(/\s+/g, ' ');
 
+  function readCelestial() {
+    const rows = [...document.querySelectorAll('.character-info--list')];
+    const row = rows.find((item) => normalize(item.querySelector('.skill-desc')?.textContent) === 'reino celestial');
+    return row?.querySelector('.value')?.textContent?.trim() || null;
+  }
+
+  function readRunes() {
+    const grid = document.querySelector('[data-pw187-panel="skills"] [data-pw187-section="runes"]');
+    if (!grid) return null;
+    const equipped = [...grid.querySelectorAll('.pw187-rune-pair__rune.is-filled')];
+    const list = equipped.map((slot) => {
+      const label = slot.getAttribute('aria-label') || '';
+      const nameMatch = label.match(/^(.*?)\s+(?:N[ií]vel|Nv\.?)\s*(\d+)/i);
+      const level = nameMatch ? Number(nameMatch[2]) : null;
+      const rawName = nameMatch ? nameMatch[1].replace(/^Runa\s+/i, '') : label.split('·')[0].trim();
+      return { name: rawName || 'Runa', level, slot: slot.closest('[data-rune-slot]')?.getAttribute('data-rune-slot') };
+    });
+    return { count: list.length, list };
+  }
+
+  function readWeapon() {
+    const slot = document.querySelector('[data-pw187-panel="inventory"] .pw187-detail-inventory-upper section:first-child li[data-item]');
+    if (!slot) return null;
+    let data;
+    try { data = JSON.parse(slot.getAttribute('data-item')); }
+    catch { return null; }
+    const name = data.item_name || data.name || data.title || 'Arma';
+    const tooltip = slot.querySelector('[data-pw187-tooltip]')?.getAttribute('data-pw187-tooltip') || '';
+    if (!tooltip) return { name, attackLevel: null, lines: 0 };
+    const parsed = new DOMParser().parseFromString(tooltip.replace(/<br\s*\/?\s*>/gi, ' '), 'text/html');
+    const text = parsed.body.textContent || '';
+    const values = [...text.matchAll(/N[ií]vel\s+de\s+Ataque\s*\+\s*(\d+)/gi)].map((match) => Number(match[1]));
+    return { name, attackLevel: values.reduce((sum, value) => sum + value, 0), lines: values.length };
+  }
+
   function readCards() {
     const equippedContainer = document.querySelector('.pw187-equipped-cards');
     const collection = document.querySelector('[data-pw187-panel="inventory"] [data-pw187-subpanel="cards"]');
@@ -96,8 +135,12 @@
     });
     const equippedFound = CARD_NAMES.filter((name) => equipped.some((card) => card.startsWith(normalize(name))));
     const found = CARD_NAMES.filter((name) => [...equipped, ...stored].some((card) => card.startsWith(normalize(name))));
+    const groups = CARD_GROUPS.map((group) => {
+      const owned = group.names.filter((name) => found.includes(name));
+      return { label: group.label, found: owned, count: owned.length, complete: owned.length === group.names.length };
+    });
     return { found, count: found.length, complete: found.length === CARD_NAMES.length,
-      equippedCount: equippedFound.length, fromCollection: found.length > equippedFound.length };
+      equippedCount: equippedFound.length, fromCollection: found.length > equippedFound.length, groups };
   }
 
   function parsePrice() {
@@ -150,12 +193,15 @@
       || document.querySelector('[data-character-name]')?.getAttribute('data-character-name')?.trim()
       || `Personagem ${id || '?'}`;
     const cards = readCards();
+    const celestial = readCelestial();
+    const runes = readRunes();
+    const weapon = readWeapon();
     if (!id || price === null || bag.error) {
-      return { id, name, price, cards, totals: bag.totals || null, status: 'unknown', reason: bag.error || 'ID ou preço não encontrado.' };
+      return { id, name, price, cards, celestial, runes, weapon, totals: bag.totals || null, status: 'unknown', reason: bag.error || 'ID ou preço não encontrado.' };
     }
     const decision = classify(price, bag.totals);
     return {
-      id, name, price, cards, totals: bag.totals, slots: bag.slots, byTab: bag.byTab,
+      id, name, price, cards, celestial, runes, weapon, totals: bag.totals, slots: bag.slots, byTab: bag.byTab,
       ...decision,
       url: location.origin + location.pathname,
       time: new Date().toISOString(),
@@ -206,7 +252,7 @@
       const quantityDistance = ITEMS.reduce((sum, item) =>
         sum + Math.abs(Math.min(record.totals[item.key], 100) - Math.min(other.totals[item.key], 100)) / 100, 0) / 3;
       const cardDistance = record.cards && other.cards
-        ? Math.abs(record.cards.count - other.cards.count) / 6 : 0.3;
+        ? Math.abs(record.cards.count - other.cards.count) / CARD_NAMES.length : 0.3;
       const weight = 1 / (0.25 + priceDistance + quantityDistance + 0.4 * cardDistance);
       return { rating: other.rating, weight };
     }).sort((a, b) => b.weight - a.weight).slice(0, 5);
@@ -223,20 +269,45 @@
       <style>
         :host { all: initial; }
         .panel { position: fixed; z-index: 2147483640; right: 18px; bottom: 18px;
-          width: 310px; max-width: calc(100vw - 36px); background: #111827; color: #f9fafb;
-          border: 1px solid #475569; border-radius: 12px; padding: 14px;
-          box-shadow: 0 12px 38px #0009; font: 13px/1.45 Arial,sans-serif; }
-        .head { display:flex; align-items:center; justify-content:space-between; margin-bottom:7px; gap:8px; }
-        .head b { font-size:15px; }
-        button { cursor:pointer; background:#334155; color:white; border:0; padding:7px 9px; border-radius:7px; }
-        button:hover { background:#475569; }
-        .status { margin:9px 0; padding:9px; border-radius:7px; font-weight:bold; }
+          width: 385px; max-width: calc(100vw - 36px); max-height: 88vh; overflow:auto;
+          background: #101827; color: #f9fafb; border: 1px solid #46566f;
+          border-radius: 16px; padding: 16px; box-shadow: 0 18px 48px #000b;
+          font: 13px/1.45 Arial,sans-serif; scrollbar-width: thin; }
+        .head { display:flex; align-items:center; justify-content:space-between; margin-bottom:12px; gap:8px; }
+        .head b { font-size:15px; letter-spacing:.2px; }
+        .version { display:inline-block; margin-left:6px; font-size:10px; color:#a5b4fc; border:1px solid #6366f1;
+          border-radius:99px; padding:2px 6px; vertical-align:2px; }
+        button { cursor:pointer; background:#253752; color:white; border:1px solid #425570;
+          padding:8px 10px; border-radius:8px; font-weight:600; }
+        button:hover { background:#395473; }
+        .identity { font-size:13px; font-weight:600; color:#e2e8f0; line-height:1.5; overflow-wrap:anywhere; }
+        .status { margin:10px 0 14px; padding:10px; border-radius:9px; font-weight:bold; }
         .pass { color:#bbf7d0; background:#14532d; }
         .fail { color:#fecaca; background:#7f1d1d; }
         .unknown { color:#fde68a; background:#78350f; }
         .item { display:flex; justify-content:space-between; margin:7px 0; gap:10px; }
         .ok { color:#86efac; } .bad { color:#fca5a5; }
         .muted { color:#cbd5e1; font-size:12px; }
+        .priority { display:grid; grid-template-columns:1fr 1fr; gap:9px; }
+        .feature { background:#172438; border:1px solid #30435d; border-radius:11px;
+          padding:11px; min-width:0; }
+        .feature.wide { grid-column:1 / -1; }
+        .eyebrow { color:#9caec7; font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:.5px; }
+        .featureValue { font-size:17px; font-weight:800; margin-top:5px; overflow-wrap:anywhere; }
+        .subvalue { color:#cbd5e1; font-size:12px; margin-top:4px; }
+        .chips { display:flex; flex-wrap:wrap; gap:5px; margin-top:7px; }
+        .chip { display:inline-block; border-radius:6px; padding:3px 6px; background:#283a52;
+          color:#e2e8f0; font-size:11px; }
+        .chip.found { background:#14532d; color:#bbf7d0; }
+        .chip.missing { color:#94a3b8; background:#1e293b; }
+        .cardGroup + .cardGroup { margin-top:9px; padding-top:9px; border-top:1px solid #334155; }
+        .groupHead { display:flex; justify-content:space-between; gap:8px; align-items:center;
+          font-size:12px; font-weight:bold; }
+        .sectionDetails { margin-top:12px; border:1px solid #334155; border-radius:10px;
+          background:#151f30; padding:10px; }
+        .sectionDetails summary { cursor:pointer; font-weight:700; }
+        .sectionDetails > .muted { margin-top:6px; }
+        .subtleLine { margin:8px 0; border-top:1px solid #2e4059; }
         .actions { display:flex; gap:6px; flex-wrap:wrap; margin-top:12px; }
         .linkbox { display:flex; gap:5px; margin-top:10px; }
         .linkbox input { min-width:0; flex:1; background:#1e293b; color:white; border:1px solid #64748b;
@@ -260,15 +331,39 @@
         @media(max-width:670px) { .columns { grid-template-columns:1fr; } }
         [hidden] { display:none!important; }
       </style>
-      <aside class="panel" aria-label="Scanner de Relíquias">
-        <div class="head"><b>🔎 PW Scanner</b><button id="toggle" title="Minimizar">−</button></div>
+      <aside class="panel" aria-label="Scanner de Personagens">
+        <div class="head"><b>✦ PW Scanner <span class="version">v1.6</span></b><button id="toggle" title="Minimizar">−</button></div>
         <div id="body">
-          <div class="muted" id="identity"></div>
+          <div class="identity" id="identity"></div>
           <div id="status" class="status unknown">Analisando…</div>
-          <div id="items"></div>
-          <div class="muted" id="sourceBreakdown"></div>
-          <div class="muted" id="cards"></div>
-          <div class="muted" id="reason"></div>
+          <div class="priority">
+            <section class="feature">
+              <div class="eyebrow">01 · Reino Celestial</div>
+              <div class="featureValue" id="celestial">—</div>
+            </section>
+            <section class="feature">
+              <div class="eyebrow">02 · Runas equipadas</div>
+              <div class="featureValue" id="runeCount">—</div>
+              <div class="chips" id="runeList"></div>
+            </section>
+            <section class="feature wide">
+              <div class="eyebrow">03 · Combos de cartas</div>
+              <div class="featureValue" id="cardsSummary">—</div>
+              <div id="cardGroups"></div>
+            </section>
+            <section class="feature wide">
+              <div class="eyebrow">04 · Nível de Ataque da Arma</div>
+              <div class="featureValue" id="attackLevel">—</div>
+              <div class="subvalue" id="weaponName"></div>
+            </section>
+          </div>
+          <details class="sectionDetails" open>
+            <summary>Relíquias · 30+ em pelo menos 2/3</summary>
+            <div id="items"></div>
+            <div class="muted" id="sourceBreakdown"></div>
+            <div class="muted" id="reason"></div>
+          </details>
+          <div class="subtleLine"></div>
           <div class="muted" id="prediction"></div>
           <div class="muted" id="saved"></div>
           <div class="actions">
@@ -299,6 +394,12 @@
 
     const el = (id) => shadow.getElementById(id);
     const setText = (id, value) => { el(id).textContent = value; };
+    function addChip(container, label, tone = '') {
+      const chip = document.createElement('span');
+      chip.className = `chip ${tone}`;
+      chip.textContent = label;
+      container.append(chip);
+    }
     el('safeMode').checked = safeModeEnabled();
     el('safeMode').addEventListener('change', () => {
       try { localStorage.setItem(SAFE_MODE_KEY, el('safeMode').checked ? 'on' : 'off'); }
@@ -313,6 +414,37 @@
       const status = el('status');
       status.className = `status ${record.status}`;
       status.textContent = record.status === 'pass' ? `✅ APROVADA (${record.qualified}/3)` : record.status === 'fail' ? `❌ REPROVADA (${record.qualified ?? '?'}/3)` : '⚠️ NÃO FOI POSSÍVEL CONFIRMAR';
+
+      setText('celestial', record.celestial || 'Não identificado');
+      setText('runeCount', record.runes ? `${record.runes.count} equipada(s)` : 'Não identificado');
+      const runeList = el('runeList');
+      runeList.replaceChildren();
+      if (record.runes?.count) {
+        for (const rune of record.runes.list) addChip(runeList, `${rune.name} · ${rune.level === null ? 'Nv. ?' : `Nv. ${rune.level}`}`);
+      } else if (record.runes) addChip(runeList, 'Nenhuma runa equipada', 'missing');
+
+      const groups = el('cardGroups');
+      groups.replaceChildren();
+      setText('cardsSummary', record.cards ? `${record.cards.count}/${CARD_NAMES.length} cartas encontradas` : 'Não identificado');
+      for (const group of CARD_GROUPS) {
+        const box = document.createElement('div');
+        box.className = 'cardGroup';
+        const head = document.createElement('div');
+        head.className = 'groupHead';
+        const found = record.cards?.found || [];
+        const count = group.names.filter((name) => found.includes(name)).length;
+        head.textContent = `${group.label}: ${count}/${group.names.length}${count === group.names.length ? ' ✓ completo' : ''}`;
+        box.append(head);
+        const chips = document.createElement('div');
+        chips.className = 'chips';
+        for (const name of group.names) addChip(chips, name, found.includes(name) ? 'found' : 'missing');
+        box.append(chips);
+        groups.append(box);
+      }
+      setText('attackLevel', record.weapon?.attackLevel === null || !record.weapon ? 'Não identificado'
+        : `+${record.weapon.attackLevel} níveis`);
+      setText('weaponName', record.weapon?.name || 'Arma não identificada');
+
       const items = el('items');
       items.replaceChildren();
       for (const item of ITEMS) {
@@ -331,7 +463,6 @@
       setText('sourceBreakdown', sources
         ? `Origem: Inventário (${ITEMS.map((i) => sources.bag[i.key]).join('/')}) · Banco (${ITEMS.map((i) => sources.bank[i.key]).join('/')}) · Cartas (${ITEMS.map((i) => sources.cards[i.key]).join('/')}) — ordem Arma/Armadura/Artefato`
         : 'Origem: não disponível para esta análise');
-      setText('cards', record.cards ? `🃏 Cartas encontradas: ${record.cards.count}/6 (${record.cards.equippedCount}/6 equipadas)${record.cards.complete ? ' — COMBO DISPONÍVEL!' : ''} (${record.cards.found.join(', ') || 'nenhuma'})` : '🃏 Cartas não identificadas');
       setText('reason', record.reason);
       const values = Object.values(getSaved());
       setText('saved', `${values.length} conta(s) verificadas · ${values.filter((v) => v.status === 'pass').length} aprovada(s)`);
@@ -353,7 +484,7 @@
       const details = document.createElement('div');
       details.className = 'muted';
       const t = record.totals || {};
-      details.textContent = `${record.price} TCC · Arma ${t.arma ?? '?'} · Armadura ${t.armadura ?? '?'} · Artefato ${t.artefato ?? '?'} · Cartas ${record.cards ? `${record.cards.count}/6` : '?'}`;
+      details.textContent = `${record.price} TCC · Céu ${record.celestial || '?'} · Runas ${record.runes?.count ?? '?'} · Nível de Ataque ${record.weapon?.attackLevel ?? '?'} · Relíquias ${t.arma ?? '?'}/${t.armadura ?? '?'}/${t.artefato ?? '?'} · Cartas ${record.cards ? `${record.cards.count}/${CARD_NAMES.length}` : '?'}`;
       item.append(details);
 
       const predicted = estimate(record, all);
@@ -451,7 +582,7 @@
     el('copy').addEventListener('click', async () => {
       const lines = Object.values(getSaved()).filter((v) => v.status === 'pass')
         .sort((a, b) => a.price - b.price)
-        .map((v) => `${v.name || v.id} | ${v.price} TCC | Arma ${v.totals.arma} | Armadura ${v.totals.armadura} | Artefato ${v.totals.artefato} | Cartas ${v.cards?.count ?? '?'}/6 | ${v.url}`);
+        .map((v) => `${v.name || v.id} | ${v.price} TCC | Céu ${v.celestial || '?'} | Runas ${v.runes?.count ?? '?'} | Arma Atq ${v.weapon?.attackLevel ?? '?'} | Relíquias ${v.totals.arma}/${v.totals.armadura}/${v.totals.artefato} | Cartas ${v.cards?.count ?? '?'}/${CARD_NAMES.length} | ${v.url}`);
       if (!lines.length) { setText('notice', 'Nenhuma conta aprovada ainda.'); return; }
       try {
         await navigator.clipboard.writeText(lines.join('\n'));
