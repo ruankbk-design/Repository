@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         PW 1.8.7 - Scanner de Reliquias
 // @namespace    local.pw187.reliquias
-// @version      1.7.0
-// @description  Painel de céu, runas, cartas, arma e relíquias; histórico e notas locais.
+// @version      1.8.0
+// @description  Filtros personalizáveis, essência dracônica, cartas, pedras, histórico e notas locais.
 // @match        https://marketplace.theclassic.games/pw187*
 // @run-at       document-idle
 // @grant        none
@@ -22,6 +22,7 @@
 
   const PREFIX = 'pw187_relic_scan_v1';
   const KEY = `${PREFIX}_results`;
+  const FILTER_KEY = `${PREFIX}_filters_v2`;
   const ITEMS = [
     { key: 'arma', name: 'Relíquia Maravilha: Arma', id: 50410, icon: '⚔️' },
     { key: 'armadura', name: 'Relíquia Maravilha: Armadura', id: 70020, icon: '🛡️' },
@@ -39,6 +40,22 @@
   const LAST_NAV_KEY = `${PREFIX}_last_navigation`;
   const NAV_COOLDOWN_MS = 8000;
   const SCANNER_TAB_NAME = 'PW187ScannerSingleTab';
+  const DEFAULT_FILTERS = {
+    price: true, relics: true, celestial: false, runes: false,
+    cards: false, attack: false, draconic: false, stones: false,
+    minPrice: 40, maxPrice: 100, minRelics: 30, minRunes: 1,
+    celestialText: '', minAttack: 1, minDraconic: 1, minStones: 1,
+    cardCombo: 'either',
+  };
+
+  function getFilters() {
+    try { return { ...DEFAULT_FILTERS, ...JSON.parse(localStorage.getItem(FILTER_KEY) || '{}') }; }
+    catch { return { ...DEFAULT_FILTERS }; }
+  }
+
+  function saveFilters(filters) {
+    try { localStorage.setItem(FILTER_KEY, JSON.stringify(filters)); } catch { /* Persistência opcional. */ }
+  }
 
   function safeModeEnabled() {
     try { return localStorage.getItem(SAFE_MODE_KEY) !== 'off'; }
@@ -71,20 +88,80 @@
     onMessage(safeModeEnabled() ? 'Anúncio aberto na aba única do scanner.' : 'Anúncio aberto em nova aba.');
   }
 
-  function classify(price, totals) {
-    const priceOk = price >= MIN_PRICE && price <= MAX_PRICE;
-    const qualified = ITEMS.filter((i) => totals[i.key] >= MIN).length;
-    return {
-      qualified,
-      status: priceOk && qualified === 3 ? 'pass' : 'fail',
-      reason: !priceOk ? 'Preço fora de 40–100 TCC'
-        : qualified < 3 ? `Apenas ${qualified}/3 relíquias atingiram 30 unidades`
-          : `${qualified}/3 relíquias atingiram 30 unidades`,
+  function classify(record, settings = getFilters()) {
+    const failures = [];
+    const unknown = [];
+    const check = (enabled, known, condition, message) => {
+      if (!enabled) return;
+      if (!known) unknown.push(message);
+      else if (!condition) failures.push(message);
     };
+    const totals = record.totals;
+    const qualified = ITEMS.filter((i) => totals?.[i.key] >= settings.minRelics).length;
+    check(settings.price, Number.isFinite(record.price), record.price >= settings.minPrice && record.price <= settings.maxPrice,
+      `Preço fora de ${settings.minPrice}–${settings.maxPrice} TCC`);
+    check(settings.relics, !!totals && ITEMS.every((i) => Number.isFinite(totals[i.key])), qualified === 3,
+      `Relíquias: ${qualified}/3 tipos com pelo menos ${settings.minRelics}`);
+    check(settings.celestial, !!record.celestial, normalize(record.celestial).includes(normalize(settings.celestialText)),
+      `Céu não corresponde a "${settings.celestialText}"`);
+    check(settings.runes, !!record.runes, (record.runes?.count || 0) >= settings.minRunes,
+      `Menos de ${settings.minRunes} runa(s) equipada(s)`);
+    const cardGroups = record.cards?.groups || [];
+    const comboOk = settings.cardCombo === 'both' ? cardGroups.length === 2 && cardGroups.every((g) => g.complete)
+      : settings.cardCombo === 'first' ? !!cardGroups[0]?.complete
+        : settings.cardCombo === 'second' ? !!cardGroups[1]?.complete : cardGroups.some((g) => g.complete);
+    check(settings.cards, !!record.cards, comboOk, 'Combo de cartas incompleto');
+    check(settings.attack, record.weapon?.attackLevel !== null && record.weapon?.attackLevel !== undefined,
+      (record.weapon?.attackLevel || 0) >= settings.minAttack, `Arma com menos de +${settings.minAttack} níveis de ataque`);
+    check(settings.draconic, record.draconic?.count !== null && record.draconic?.count !== undefined,
+      (record.draconic?.count || 0) >= settings.minDraconic, `Essência Dracônica abaixo de ${settings.minDraconic}`);
+    check(settings.stones, !!record.stones,
+      (record.stones?.total || 0) >= settings.minStones, `Menos de ${settings.minStones} pedra(s) equipadas`);
+    return { qualified, status: failures.length ? 'fail' : unknown.length ? 'unknown' : 'pass',
+      reason: failures.length ? failures.join(' · ') : unknown.length ? `Não identificado: ${unknown.join(', ')}` : 'Todos os filtros ativos foram atendidos.' };
   }
 
   const normalize = (s) => String(s ?? '').normalize('NFD')
     .replace(/[\u0300-\u036f]/g, '').trim().toLowerCase().replace(/\s+/g, ' ');
+
+  function tooltipText(html) {
+    return new DOMParser().parseFromString(String(html || '').replace(/<br\s*\/?\s*>/gi, '\n'), 'text/html').body.textContent || '';
+  }
+
+  function cardRebirth(node) {
+    const img = node.querySelector('[data-pw187-tooltip]') || node;
+    const text = tooltipText(img.getAttribute('data-pw187-tooltip'));
+    const match = text.match(/(?:renascimentos?|renascid[ao]s?|rebirths?|reawakenings?)\s*[:+]?\s*(\d+)/i)
+      || text.match(/(\d+)\s*(?:renascimentos?|rebirths?)/i);
+    if (match) return Number(match[1]);
+    for (const key of ['reborn_times', 'rebirth', 'rebirth_count', 'reincarnation']) {
+      const raw = img.getAttribute(`data-${key.replace(/_/g, '-')}`) || node.getAttribute(`data-${key.replace(/_/g, '-')}`);
+      if (raw !== null && /^\d+$/.test(raw)) return Number(raw);
+    }
+    return null;
+  }
+
+  function readStones() {
+    const upper = document.querySelector('[data-pw187-panel="inventory"] .pw187-detail-inventory-upper');
+    if (!upper) return null;
+    const equipment = [...upper.querySelectorAll('li[data-item]')].map((slot) => {
+      let data;
+      try { data = JSON.parse(slot.getAttribute('data-item')); } catch { return null; }
+      const ids = data.decoded?.slots?.slotStones;
+      if (!Array.isArray(ids)) return null;
+      const stones = ids.filter((id) => Number(id) > 0);
+      if (!stones.length) return { name: data.item_name || data.name || 'Equipamento', stones: [] };
+      const html = slot.querySelector('[data-pw187-tooltip]')?.getAttribute('data-pw187-tooltip') || '';
+      const doc = new DOMParser().parseFromString(html, 'text/html');
+      const names = [...doc.querySelectorAll('span')].filter((span) => span.querySelector('img[src]'))
+        .map((span) => ({ id: Number(span.querySelector('img').getAttribute('src')?.match(/\/(\d+)\.png/)?.[1]),
+          name: span.textContent.trim() }));
+      return { name: data.item_name || data.name || 'Equipamento', stones: stones.map((id, i) => ({
+        id: Number(id), name: names[i]?.id === Number(id) ? names[i].name : `Pedra ID ${id}`,
+      })) };
+    }).filter(Boolean);
+    return { total: equipment.reduce((sum, item) => sum + item.stones.length, 0), equipment };
+  }
 
   function readCelestial() {
     const rows = [...document.querySelectorAll('.character-info--list')];
@@ -125,22 +202,28 @@
     const equippedContainer = document.querySelector('.pw187-equipped-cards');
     const collection = document.querySelector('[data-pw187-panel="inventory"] [data-pw187-subpanel="cards"]');
     if (!equippedContainer && !collection) return null;
-    const equipped = [...(equippedContainer?.querySelectorAll('.pw187-equipped-card.is-filled') || [])]
-      .map((node) => normalize(node.getAttribute('title') || node.querySelector('img')?.alt));
-    const stored = [...(collection?.querySelectorAll('li[data-item]') || [])].map((element) => {
+    const equippedDetails = [...(equippedContainer?.querySelectorAll('.pw187-equipped-card.is-filled') || [])]
+      .map((node) => ({ name: node.getAttribute('title') || node.querySelector('img')?.alt || '', rebirth: cardRebirth(node) }));
+    const storedDetails = [...(collection?.querySelectorAll('li[data-item]') || [])].map((element) => {
       try {
         const item = JSON.parse(element.getAttribute('data-item'));
-        return normalize(item.item_name || item.name || item.title);
-      } catch { return ''; }
+        const rebirth = ['reborn_times', 'rebirth', 'rebirth_count'].map((key) => item[key] ?? item.decoded?.[key])
+          .find((value) => Number.isSafeInteger(value) && value >= 0);
+        return { name: item.item_name || item.name || item.title || '', rebirth: rebirth ?? cardRebirth(element) };
+      } catch { return { name: '', rebirth: null }; }
     });
-    const equippedFound = CARD_NAMES.filter((name) => equipped.some((card) => card.startsWith(normalize(name))));
-    const found = CARD_NAMES.filter((name) => [...equipped, ...stored].some((card) => card.startsWith(normalize(name))));
+    const equippedFound = CARD_NAMES.filter((name) => equippedDetails.some((card) => normalize(card.name).startsWith(normalize(name))));
+    const found = CARD_NAMES.filter((name) => [...equippedDetails, ...storedDetails]
+      .some((card) => normalize(card.name).startsWith(normalize(name))));
+    const details = [...equippedDetails, ...storedDetails];
+    const rebirths = CARD_NAMES.map((name) => ({ name, owned: found.includes(name),
+      values: details.filter((card) => normalize(card.name).startsWith(normalize(name))).map((card) => card.rebirth) }));
     const groups = CARD_GROUPS.map((group) => {
       const owned = group.names.filter((name) => found.includes(name));
       return { label: group.label, found: owned, count: owned.length, complete: owned.length === group.names.length };
     });
     return { found, count: found.length, complete: found.length === CARD_NAMES.length,
-      equippedCount: equippedFound.length, fromCollection: found.length > equippedFound.length, groups };
+      equippedCount: equippedFound.length, fromCollection: found.length > equippedFound.length, groups, rebirths };
   }
 
   function parsePrice() {
@@ -158,6 +241,7 @@
     const byTab = {};
     let invalid = 0;
     let slots = 0;
+    let draconic = 0;
     for (const [tab, label] of Object.entries(names)) {
       const container = document.querySelector(`[data-pw187-panel="inventory"] [data-pw187-subpanel="${tab}"]`);
       if (!container) return { error: `A aba ${label} não foi encontrada no HTML.` };
@@ -172,17 +256,30 @@
         const name = normalize(data.item_name || data.name || data.title);
         const id = Number(data.id);
         const target = ITEMS.find((i) => id === i.id || name === normalize(i.name));
-        if (!target) continue;
+        if (!target && name !== normalize('Essência Dracônica')) continue;
 
         const count = Number(data.count);
         if (!Number.isSafeInteger(count) || count < 1) { invalid++; continue; }
-        totals[target.key] += count;
-        byTab[tab][target.key] += count;
+        if (target) { totals[target.key] += count; byTab[tab][target.key] += count; }
+        else draconic += count;
+      }
+    }
+    // Outras bolsas podem guardar Essência Dracônica; não contam para relíquias.
+    for (const container of document.querySelectorAll('[data-pw187-panel="inventory"] [data-pw187-subpanel]')) {
+      if (['bag', 'bank', 'cards'].includes(container.getAttribute('data-pw187-subpanel'))) continue;
+      for (const element of container.querySelectorAll('li[data-item]')) {
+        try {
+          const data = JSON.parse(element.getAttribute('data-item'));
+          if (normalize(data.item_name || data.name || data.title) !== normalize('Essência Dracônica')) continue;
+          const count = Number(data.count);
+          if (Number.isSafeInteger(count) && count > 0) draconic += count;
+          else invalid++;
+        } catch { /* Aba complementar sem dados reconhecíveis. */ }
       }
     }
     if (invalid) return { error: `${invalid} item(ns) com dados inválidos. Conferir manualmente.` };
     if (!slots) return { error: 'Nenhum item estruturado foi encontrado nas três abas.' };
-    return { totals, slots, byTab };
+    return { totals, slots, byTab, draconic };
   }
 
   function readRecord() {
@@ -196,34 +293,35 @@
     const celestial = readCelestial();
     const runes = readRunes();
     const weapon = readWeapon();
+    const stones = readStones();
+    const draconic = { count: bag.error ? null : bag.draconic };
     if (!id || price === null || bag.error) {
-      return { id, name, price, cards, celestial, runes, weapon, totals: bag.totals || null, status: 'unknown', reason: bag.error || 'ID ou preço não encontrado.' };
+      return { id, name, price, cards, celestial, runes, weapon, stones, draconic,
+        totals: bag.totals || null, status: 'unknown', reason: bag.error || 'ID ou preço não encontrado.' };
     }
-    const decision = classify(price, bag.totals);
-    return {
-      id, name, price, cards, celestial, runes, weapon, totals: bag.totals, slots: bag.slots, byTab: bag.byTab,
-      ...decision,
+    const record = {
+      id, name, price, cards, celestial, runes, weapon, stones, draconic,
+      totals: bag.totals, slots: bag.slots, byTab: bag.byTab,
       url: location.origin + location.pathname,
       time: new Date().toISOString(),
     };
+    return { ...record, ...classify(record) };
   }
 
   function getSaved() {
     try {
       const value = JSON.parse(localStorage.getItem(KEY) || '{}');
       if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
-      // Reclassifica resultados antigos usando a regra atual 3/3.
+      // Reclassifica o histórico quando os filtros são ajustados.
       for (const record of Object.values(value)) {
-        if (typeof record?.price === 'number' && record.totals && ITEMS.every((i) => Number.isFinite(record.totals[i.key]))) {
-          Object.assign(record, classify(record.price, record.totals));
-        }
+        if (record && typeof record === 'object') Object.assign(record, classify(record));
       }
       return value;
     } catch { return {}; }
   }
 
   function save(record) {
-    if (record.status === 'unknown') return;
+    if (!record.id || !record.totals || !Number.isFinite(record.price)) return;
     try {
       const records = getSaved();
       records[record.id] = { ...records[record.id], ...record };
@@ -330,14 +428,31 @@
         .entry a { color:#93c5fd; font-weight:bold; overflow-wrap:anywhere; }
         .entry select { background:#1e293b; color:white; border:1px solid #64748b; border-radius:5px; padding:5px; }
         .rating { display:flex; justify-content:space-between; align-items:center; gap:8px; margin-top:6px; }
+        .filterRow { display:grid; grid-template-columns:18px minmax(0,1fr) 102px; gap:7px; align-items:center;
+          padding:7px 0; border-bottom:1px solid #29394d; }
+        .filterRow:last-child { border:0; }
+        .filterRow input[type="checkbox"] { accent-color:#22c55e; }
+        .filterRow input:not([type="checkbox"]), .filterRow select { width:100%; box-sizing:border-box;
+          background:#1e293b; color:white; border:1px solid #52657e; border-radius:6px; padding:5px; min-width:0; }
+        .filterRow input:disabled, .filterRow select:disabled { opacity:.42; }
+        .filterLabel { font-size:12px; color:#e2e8f0; }
+        .filterDouble { display:flex; align-items:center; gap:3px; }
+        .filterDouble input { width:45%!important; }
+        .stoneLine { margin:5px 0; overflow-wrap:anywhere; }
         @media(max-width:670px) { .columns { grid-template-columns:1fr; } }
         [hidden] { display:none!important; }
       </style>
       <aside class="panel" aria-label="Scanner de Personagens">
-        <div class="head"><b>✦ PW Scanner <span class="version">v1.7</span></b><button id="toggle" title="Minimizar">−</button></div>
+        <div class="head"><b>✦ PW Scanner <span class="version">v1.8</span></b><button id="toggle" title="Minimizar">−</button></div>
         <div id="body">
           <div class="identity" id="identity"></div>
           <div id="status" class="status unknown">Analisando…</div>
+          <details class="sectionDetails" open>
+            <summary>⚙️ Filtros de classificação (ativar/desativar)</summary>
+            <div class="muted">Só os critérios marcados decidem aprovação. Alterações reclassificam o histórico salvo.</div>
+            <div id="filterSettings"></div>
+            <div class="actions"><button id="resetFilters">Restaurar filtros padrão</button></div>
+          </details>
           <div class="priority">
             <section class="feature">
               <div class="eyebrow">01 · Reino Celestial</div>
@@ -358,9 +473,23 @@
               <div class="featureValue" id="attackLevel">—</div>
               <div class="subvalue" id="weaponName"></div>
             </section>
+            <section class="feature">
+              <div class="eyebrow">05 · Essência Dracônica</div>
+              <div class="featureValue" id="draconic">—</div>
+              <div class="subvalue">Inventário, banco e cartas</div>
+            </section>
+            <section class="feature">
+              <div class="eyebrow">06 · Pedras equipadas</div>
+              <div class="featureValue" id="stonesTotal">—</div>
+              <div class="subvalue">Pedras encaixadas nos equipamentos</div>
+            </section>
+            <section class="feature wide">
+              <div class="eyebrow">Pedras por equipamento</div>
+              <div id="stonesList"></div>
+            </section>
           </div>
           <details class="sectionDetails" open>
-            <summary>Relíquias · 30+ em todas as 3/3</summary>
+            <summary>Relíquias · quantidade por tipo</summary>
             <div id="items"></div>
             <div class="muted" id="sourceBreakdown"></div>
             <div class="muted" id="reason"></div>
@@ -385,12 +514,13 @@
       <div class="overlay" id="overlay" hidden>
         <section class="modal" role="dialog" aria-modal="true" aria-label="Histórico do scanner">
           <div class="modalhead"><b>📋 Contas analisadas</b><div class="actions"><button class="dangerButton" id="clearHistory">Apagar histórico</button><button id="close">Fechar ✕</button></div></div>
-          <div class="muted">Sua nota de 1 a 5 mede o custo-benefício percebido. Ela não altera os critérios de classificação.</div>
+          <div class="muted">Filtros ativos determinam a classificação. Sua nota de 1 a 5 mede custo-benefício, sem alterar os filtros.</div>
           <div class="muted" id="learning"></div>
           <div class="columns">
             <section class="column"><h3>✅ Classificadas (<span id="passedCount">0</span>)</h3><div id="passedList"></div></section>
             <section class="column"><h3>❌ Desclassificadas (<span id="failedCount">0</span>)</h3><div id="failedList"></div></section>
           </div>
+          <section class="column" style="margin-top:12px"><h3>⚠️ Dados pendentes (<span id="unknownCount">0</span>)</h3><div id="unknownList"></div></section>
         </section>
       </div>`;
 
@@ -402,6 +532,72 @@
       chip.textContent = label;
       container.append(chip);
     }
+    const filterDefs = [
+      ['price', 'Preço (TCC)', 'range', 'minPrice', 'maxPrice'],
+      ['relics', 'Relíquias (3/3)', 'number', 'minRelics'],
+      ['celestial', 'Reino celestial contém', 'text', 'celestialText'],
+      ['runes', 'Runas equipadas (mínimo)', 'number', 'minRunes'],
+      ['cards', 'Combo de cartas completo', 'select', 'cardCombo'],
+      ['attack', 'Nível de ataque da arma', 'number', 'minAttack'],
+      ['draconic', 'Essência Dracônica', 'number', 'minDraconic'],
+      ['stones', 'Pedras equipadas', 'number', 'minStones'],
+    ];
+    let filters = getFilters();
+    function showFilters() {
+      const container = el('filterSettings');
+      container.replaceChildren();
+      for (const [key, label, type, prop, prop2] of filterDefs) {
+        const row = document.createElement('label');
+        row.className = 'filterRow';
+        const toggle = document.createElement('input');
+        toggle.type = 'checkbox';
+        toggle.checked = !!filters[key];
+        toggle.dataset.filter = key;
+        const caption = document.createElement('span');
+        caption.className = 'filterLabel';
+        caption.textContent = label;
+        let field;
+        if (type === 'select') {
+          field = document.createElement('select');
+          for (const [value, name] of [['either', 'Combo 1 ou 2'], ['first', 'Combo 1'], ['second', 'Combo 2'], ['both', 'Ambos']]) {
+            field.add(new Option(name, value));
+          }
+        } else if (type === 'range') {
+          field = document.createElement('div');
+          field.className = 'filterDouble';
+          for (const name of [prop, prop2]) {
+            const num = document.createElement('input');
+            num.type = 'number'; num.min = '0'; num.max = '100000'; num.step = '1';
+            num.dataset.setting = name; num.value = filters[name]; num.disabled = !filters[key];
+            field.append(num);
+          }
+        } else {
+          field = document.createElement('input');
+          field.type = type;
+          if (type === 'number') { field.min = '0'; field.max = '100000'; field.step = '1'; }
+        }
+        if (type !== 'range') { field.dataset.setting = prop; field.value = filters[prop]; field.disabled = !filters[key]; }
+        row.append(toggle, caption, field);
+        container.append(row);
+      }
+    }
+    showFilters();
+    el('filterSettings').addEventListener('change', (event) => {
+      const field = event.target;
+      if (field.dataset.filter) filters[field.dataset.filter] = field.checked;
+      if (field.dataset.setting) {
+        const name = field.dataset.setting;
+        filters[name] = field.type === 'number' ? Math.max(0, Math.min(100000, Number(field.value) || 0)) : field.value;
+      }
+      saveFilters(filters);
+      showFilters();
+      render();
+    });
+    el('resetFilters').addEventListener('click', () => {
+      filters = { ...DEFAULT_FILTERS };
+      saveFilters(filters); showFilters(); render();
+      setText('notice', 'Filtros padrão restaurados: 40–100 TCC e 3/3 relíquias (30+ cada).');
+    });
     el('safeMode').checked = safeModeEnabled();
     el('safeMode').addEventListener('change', () => {
       try { localStorage.setItem(SAFE_MODE_KEY, el('safeMode').checked ? 'on' : 'off'); }
@@ -415,7 +611,7 @@
       setText('identity', `${record.name} · ID ${record.id || '?'} · ${record.price === null ? 'Preço desconhecido' : `${record.price} TCC`}`);
       const status = el('status');
       status.className = `status ${record.status}`;
-      status.textContent = record.status === 'pass' ? `✅ APROVADA (${record.qualified}/3)` : record.status === 'fail' ? `❌ REPROVADA (${record.qualified ?? '?'}/3)` : '⚠️ NÃO FOI POSSÍVEL CONFIRMAR';
+      status.textContent = record.status === 'pass' ? '✅ APROVADA PELOS FILTROS ATIVOS' : record.status === 'fail' ? '❌ REPROVADA PELOS FILTROS ATIVOS' : '⚠️ FILTRO SEM DADOS SUFICIENTES';
 
       setText('celestial', record.celestial || 'Não identificado');
       setText('runeCount', record.runes ? `${record.runes.count} equipada(s)` : 'Não identificado');
@@ -439,13 +635,39 @@
         box.append(head);
         const chips = document.createElement('div');
         chips.className = 'chips';
-        for (const name of group.names) addChip(chips, name, found.includes(name) ? 'found' : 'missing');
+        for (const name of group.names) {
+          const item = record.cards?.rebirths?.find((entry) => entry.name === name);
+          const known = item?.values?.filter((value) => value !== null && Number.isFinite(value)) || [];
+          const value = known.length ? ` · R${Math.max(...known)}` : ' · R?';
+          addChip(chips, `${name}${found.includes(name) ? value : ''}`, found.includes(name) ? 'found' : 'missing');
+        }
         box.append(chips);
         groups.append(box);
       }
       setText('attackLevel', record.weapon?.attackLevel === null || !record.weapon ? 'Não identificado'
         : `+${record.weapon.attackLevel} níveis`);
       setText('weaponName', record.weapon?.name || 'Arma não identificada');
+      setText('draconic', record.draconic?.count === null || record.draconic?.count === undefined
+        ? 'Não identificado' : `${record.draconic.count} unidade(s)`);
+      setText('stonesTotal', record.stones ? `${record.stones.total} pedra(s)` : 'Não identificado');
+      const stonesList = el('stonesList');
+      stonesList.replaceChildren();
+      if (record.stones) {
+        for (const equip of record.stones.equipment.filter((entry) => entry.stones.length)) {
+          const line = document.createElement('div');
+          line.className = 'stoneLine';
+          const heading = document.createElement('b');
+          heading.textContent = `${equip.name} (${equip.stones.length})`;
+          line.append(heading);
+          const counts = new Map();
+          for (const stone of equip.stones) counts.set(stone.name, (counts.get(stone.name) || 0) + 1);
+          const desc = document.createElement('div');
+          desc.className = 'muted';
+          desc.textContent = [...counts].map(([name, count]) => `${count}× ${name}`).join(' · ');
+          line.append(desc); stonesList.append(line);
+        }
+        if (!record.stones.total) stonesList.textContent = 'Nenhuma pedra encaixada detectada.';
+      } else stonesList.textContent = 'Pedras não identificadas.';
 
       const items = el('items');
       items.replaceChildren();
@@ -456,8 +678,8 @@
         const label = document.createElement('span');
         label.textContent = `${item.icon} ${item.name.replace('Relíquia Maravilha: ', '')}`;
         const amount = document.createElement('b');
-        amount.className = count >= MIN ? 'ok' : 'bad';
-        amount.textContent = `${count ?? '?'} / ${MIN}`;
+        amount.className = count >= filters.minRelics ? 'ok' : 'bad';
+        amount.textContent = `${count ?? '?'} / ${filters.minRelics}`;
         line.append(label, amount);
         items.append(line);
       }
@@ -486,7 +708,7 @@
       const details = document.createElement('div');
       details.className = 'muted';
       const t = record.totals || {};
-      details.textContent = `${record.price} TCC · Céu ${record.celestial || '?'} · Runas ${record.runes?.count ?? '?'} · Nível de Ataque ${record.weapon?.attackLevel ?? '?'} · Relíquias ${t.arma ?? '?'}/${t.armadura ?? '?'}/${t.artefato ?? '?'} · Cartas ${record.cards ? `${record.cards.count}/${CARD_NAMES.length}` : '?'}`;
+      details.textContent = `${record.price} TCC · Céu ${record.celestial || '?'} · Runas ${record.runes?.count ?? '?'} · Nível de Ataque ${record.weapon?.attackLevel ?? '?'} · Relíquias ${t.arma ?? '?'}/${t.armadura ?? '?'}/${t.artefato ?? '?'} · Essência ${record.draconic?.count ?? '?'} · Pedras ${record.stones?.total ?? '?'} · Cartas ${record.cards ? `${record.cards.count}/${CARD_NAMES.length}` : '?'}`;
       item.append(details);
 
       const predicted = estimate(record, all);
@@ -516,11 +738,11 @@
     }
 
     function renderHistory() {
-      const records = Object.values(getSaved()).filter((r) => r.status === 'pass' || r.status === 'fail');
+      const records = Object.values(getSaved()).filter((r) => r.status === 'pass' || r.status === 'fail' || r.status === 'unknown');
       const ratedCount = records.filter((r) => Number.isInteger(r.rating) && r.rating >= 1 && r.rating <= 5).length;
       setText('learning', `${ratedCount} conta(s) avaliadas. A estimativa compara preço, quantidade de relíquias e combo de cartas; é apenas uma referência.`);
       for (const [status, countId, listId] of [
-        ['pass', 'passedCount', 'passedList'], ['fail', 'failedCount', 'failedList'],
+        ['pass', 'passedCount', 'passedList'], ['fail', 'failedCount', 'failedList'], ['unknown', 'unknownCount', 'unknownList'],
       ]) {
         const chosen = records.filter((r) => r.status === status)
           .sort((a, b) => (b.time || '').localeCompare(a.time || ''));
@@ -596,7 +818,7 @@
     el('copy').addEventListener('click', async () => {
       const lines = Object.values(getSaved()).filter((v) => v.status === 'pass')
         .sort((a, b) => a.price - b.price)
-        .map((v) => `${v.name || v.id} | ${v.price} TCC | Céu ${v.celestial || '?'} | Runas ${v.runes?.count ?? '?'} | Arma Atq ${v.weapon?.attackLevel ?? '?'} | Relíquias ${v.totals.arma}/${v.totals.armadura}/${v.totals.artefato} | Cartas ${v.cards?.count ?? '?'}/${CARD_NAMES.length} | ${v.url}`);
+        .map((v) => `${v.name || v.id} | ${v.price} TCC | Céu ${v.celestial || '?'} | Runas ${v.runes?.count ?? '?'} | Arma Atq ${v.weapon?.attackLevel ?? '?'} | Relíquias ${v.totals.arma}/${v.totals.armadura}/${v.totals.artefato} | Essência ${v.draconic?.count ?? '?'} | Pedras ${v.stones?.total ?? '?'} | Cartas ${v.cards?.count ?? '?'}/${CARD_NAMES.length} | ${v.url}`);
       if (!lines.length) { setText('notice', 'Nenhuma conta aprovada ainda.'); return; }
       try {
         await navigator.clipboard.writeText(lines.join('\n'));
