@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         PW 1.8.7 - Scanner de Reliquias
 // @namespace    local.pw187.reliquias
-// @version      1.8.0
-// @description  Filtros personalizáveis, essência dracônica, cartas, pedras, histórico e notas locais.
+// @version      1.9.0
+// @description  Visão compacta: histórico, relíquias, combos, bônus das pedras e filtros personalizáveis.
 // @match        https://marketplace.theclassic.games/pw187*
 // @run-at       document-idle
 // @grant        none
@@ -158,9 +158,20 @@
           name: span.textContent.trim() }));
       return { name: data.item_name || data.name || 'Equipamento', stones: stones.map((id, i) => ({
         id: Number(id), name: names[i]?.id === Number(id) ? names[i].name : `Pedra ID ${id}`,
+        bonus: stoneBonus(names[i]?.id === Number(id) ? names[i].name : ''),
       })) };
     }).filter(Boolean);
     return { total: equipment.reduce((sum, item) => sum + item.stones.length, 0), equipment };
+  }
+
+  function stoneBonus(description) {
+    const text = String(description || '').replace(/\s+/g, ' ');
+    const matched = text.match(/(?:N[ií]v(?:el)?\.?\s*(?:de\s*)?)(Ataque|Defesa|Guarda)\s*\+\s*(\d+)/i)
+      || text.match(/\+\s*(\d+)\s*(?:N[ií]v(?:el)?\.?)\s*(?:de\s*)?(Ataque|Defesa|Guarda)/i);
+    if (!matched) return null;
+    const stat = /^\d+$/.test(matched[1]) ? matched[2] : matched[1];
+    const value = /^\d+$/.test(matched[1]) ? matched[1] : matched[2];
+    return `+${value} Nível de ${stat}`;
   }
 
   function readCelestial() {
@@ -439,67 +450,58 @@
         .filterDouble { display:flex; align-items:center; gap:3px; }
         .filterDouble input { width:45%!important; }
         .stoneLine { margin:5px 0; overflow-wrap:anywhere; }
+        .topHistory { display:flex; align-items:center; justify-content:space-between; gap:8px;
+          padding:10px; margin-top:10px; border-radius:10px; background:#1c2b40; border:1px solid #37506b; }
+        .topHistory button { flex-shrink:0; }
+        .compactSection { background:#172438; border:1px solid #30435d; border-radius:10px;
+          padding:10px; margin-top:9px; }
+        .compactSection h3 { margin:0 0 6px; font-size:13px; color:#e2e8f0; }
+        .compactSection .item { margin:3px 0; }
+        .smallSummary { color:#bfccdd; font-size:12px; line-height:1.6; overflow-wrap:anywhere; }
+        .bonus { color:#93c5fd; font-weight:bold; }
         @media(max-width:670px) { .columns { grid-template-columns:1fr; } }
         [hidden] { display:none!important; }
       </style>
       <aside class="panel" aria-label="Scanner de Personagens">
-        <div class="head"><b>✦ PW Scanner <span class="version">v1.8</span></b><button id="toggle" title="Minimizar">−</button></div>
+        <div class="head"><b>✦ PW Scanner <span class="version">v1.9</span></b><button id="toggle" title="Minimizar">−</button></div>
         <div id="body">
           <div class="identity" id="identity"></div>
           <div id="status" class="status unknown">Analisando…</div>
-          <details class="sectionDetails" open>
-            <summary>⚙️ Filtros de classificação (ativar/desativar)</summary>
-            <div class="muted">Só os critérios marcados decidem aprovação. Alterações reclassificam o histórico salvo.</div>
+          <div class="topHistory">
+            <div><b>📋 Histórico</b><div class="muted" id="saved"></div></div>
+            <button id="history">Ver contas e notas</button>
+          </div>
+          <section class="compactSection" id="relicSection">
+            <h3>⚔️ Relíquias · 3/3</h3>
+            <div id="items"></div>
+            <details><summary class="muted">Detalhes das origens</summary><div class="muted" id="sourceBreakdown"></div></details>
+            <div class="muted" id="reason"></div>
+          </section>
+          <section class="compactSection" id="comboSection">
+            <h3>🃏 Combo de cartas <span class="muted" id="cardsSummary"></span></h3>
+            <div id="cardGroups"></div>
+          </section>
+          <section class="compactSection" id="stoneSection">
+            <h3>💎 Pedras <span class="muted" id="stonesTotal"></span></h3>
+            <div id="stonesList"></div>
+          </section>
+          <details class="sectionDetails" id="extraDetails">
+            <summary>Outros atributos da conta</summary>
+            <div class="smallSummary">Céu: <b id="celestial">—</b> · Runas: <b id="runeCount">—</b></div>
+            <div class="smallSummary">Arma (nível de ataque): <b id="attackLevel">—</b> <span id="weaponName"></span></div>
+            <div class="smallSummary">Essência Dracônica: <b id="draconic">—</b></div>
+            <div class="chips" id="runeList"></div>
+          </details>
+          <details class="sectionDetails">
+            <summary>⚙️ Filtros de classificação</summary>
+            <div class="muted">Somente as opções marcadas afetam a aprovação.</div>
             <div id="filterSettings"></div>
             <div class="actions"><button id="resetFilters">Restaurar filtros padrão</button></div>
           </details>
-          <div class="priority">
-            <section class="feature">
-              <div class="eyebrow">01 · Reino Celestial</div>
-              <div class="featureValue" id="celestial">—</div>
-            </section>
-            <section class="feature">
-              <div class="eyebrow">02 · Runas equipadas</div>
-              <div class="featureValue" id="runeCount">—</div>
-              <div class="chips" id="runeList"></div>
-            </section>
-            <section class="feature wide">
-              <div class="eyebrow">03 · Combos de cartas</div>
-              <div class="featureValue" id="cardsSummary">—</div>
-              <div id="cardGroups"></div>
-            </section>
-            <section class="feature wide">
-              <div class="eyebrow">04 · Nível de Ataque da Arma</div>
-              <div class="featureValue" id="attackLevel">—</div>
-              <div class="subvalue" id="weaponName"></div>
-            </section>
-            <section class="feature">
-              <div class="eyebrow">05 · Essência Dracônica</div>
-              <div class="featureValue" id="draconic">—</div>
-              <div class="subvalue">Inventário, banco e cartas</div>
-            </section>
-            <section class="feature">
-              <div class="eyebrow">06 · Pedras equipadas</div>
-              <div class="featureValue" id="stonesTotal">—</div>
-              <div class="subvalue">Pedras encaixadas nos equipamentos</div>
-            </section>
-            <section class="feature wide">
-              <div class="eyebrow">Pedras por equipamento</div>
-              <div id="stonesList"></div>
-            </section>
-          </div>
-          <details class="sectionDetails" open>
-            <summary>Relíquias · quantidade por tipo</summary>
-            <div id="items"></div>
-            <div class="muted" id="sourceBreakdown"></div>
-            <div class="muted" id="reason"></div>
-          </details>
           <div class="subtleLine"></div>
           <div class="muted" id="prediction"></div>
-          <div class="muted" id="saved"></div>
           <div class="actions">
             <button id="rescan">Reanalisar</button>
-            <button id="history">📋 Histórico e notas</button>
             <button id="copy">Copiar aprovadas</button>
           </div>
           <div class="linkbox">
@@ -608,13 +610,15 @@
     function render() {
       const record = readRecord();
       save(record);
+      const onDetail = !!record.id;
+      for (const id of ['relicSection', 'comboSection', 'stoneSection', 'extraDetails']) el(id).hidden = !onDetail;
       setText('identity', `${record.name} · ID ${record.id || '?'} · ${record.price === null ? 'Preço desconhecido' : `${record.price} TCC`}`);
       const status = el('status');
       status.className = `status ${record.status}`;
-      status.textContent = record.status === 'pass' ? '✅ APROVADA PELOS FILTROS ATIVOS' : record.status === 'fail' ? '❌ REPROVADA PELOS FILTROS ATIVOS' : '⚠️ FILTRO SEM DADOS SUFICIENTES';
+      status.textContent = !onDetail ? 'Abra um anúncio para analisar a conta.' : record.status === 'pass' ? '✅ APROVADA' : record.status === 'fail' ? '❌ REPROVADA' : '⚠️ DADOS INSUFICIENTES';
 
-      setText('celestial', record.celestial || 'Não identificado');
-      setText('runeCount', record.runes ? `${record.runes.count} equipada(s)` : 'Não identificado');
+      setText('celestial', record.celestial || '—');
+      setText('runeCount', record.runes ? `${record.runes.count}` : '—');
       const runeList = el('runeList');
       runeList.replaceChildren();
       if (record.runes?.count) {
@@ -623,8 +627,11 @@
 
       const groups = el('cardGroups');
       groups.replaceChildren();
-      setText('cardsSummary', record.cards ? `${record.cards.count}/${CARD_NAMES.length} cartas encontradas` : 'Não identificado');
-      for (const group of CARD_GROUPS) {
+      setText('cardsSummary', record.cards ? `· ${record.cards.count}/${CARD_NAMES.length}` : '· —');
+      if (!record.cards) {
+        groups.textContent = 'Cartas não disponíveis nesta página.';
+      }
+      for (const group of record.cards ? CARD_GROUPS : []) {
         const box = document.createElement('div');
         box.className = 'cardGroup';
         const head = document.createElement('div');
@@ -635,21 +642,21 @@
         box.append(head);
         const chips = document.createElement('div');
         chips.className = 'chips';
-        for (const name of group.names) {
+        for (const name of group.names.filter((name) => found.includes(name))) {
           const item = record.cards?.rebirths?.find((entry) => entry.name === name);
           const known = item?.values?.filter((value) => value !== null && Number.isFinite(value)) || [];
           const value = known.length ? ` · R${Math.max(...known)}` : ' · R?';
-          addChip(chips, `${name}${found.includes(name) ? value : ''}`, found.includes(name) ? 'found' : 'missing');
+          addChip(chips, `${name}${value}`, 'found');
         }
-        box.append(chips);
+        if (chips.childNodes.length) box.append(chips);
         groups.append(box);
       }
-      setText('attackLevel', record.weapon?.attackLevel === null || !record.weapon ? 'Não identificado'
+      setText('attackLevel', record.weapon?.attackLevel === null || !record.weapon ? '—'
         : `+${record.weapon.attackLevel} níveis`);
-      setText('weaponName', record.weapon?.name || 'Arma não identificada');
+      setText('weaponName', record.weapon?.name ? `· ${record.weapon.name}` : '');
       setText('draconic', record.draconic?.count === null || record.draconic?.count === undefined
-        ? 'Não identificado' : `${record.draconic.count} unidade(s)`);
-      setText('stonesTotal', record.stones ? `${record.stones.total} pedra(s)` : 'Não identificado');
+        ? '—' : `${record.draconic.count}`);
+      setText('stonesTotal', record.stones ? `· ${record.stones.total} encaixadas` : '· —');
       const stonesList = el('stonesList');
       stonesList.replaceChildren();
       if (record.stones) {
@@ -660,14 +667,30 @@
           heading.textContent = `${equip.name} (${equip.stones.length})`;
           line.append(heading);
           const counts = new Map();
-          for (const stone of equip.stones) counts.set(stone.name, (counts.get(stone.name) || 0) + 1);
-          const desc = document.createElement('div');
-          desc.className = 'muted';
-          desc.textContent = [...counts].map(([name, count]) => `${count}× ${name}`).join(' · ');
-          line.append(desc); stonesList.append(line);
+          for (const stone of equip.stones) {
+            const key = `${stone.id}|${stone.bonus || ''}`;
+            if (!counts.has(key)) counts.set(key, { ...stone, count: 0 });
+            counts.get(key).count++;
+          }
+          for (const stone of counts.values()) {
+            const desc = document.createElement('div');
+            desc.className = 'muted';
+            const baseName = stone.bonus
+              ? stone.name.replace(/(?:N[ií]v(?:el)?\.?\s*(?:de\s*)?)(?:Ataque|Defesa|Guarda)\s*\+\s*\d+/i, '').trim()
+              : stone.name;
+            desc.append(document.createTextNode(`${stone.count}× ${baseName}`));
+            if (stone.bonus) {
+              const bonus = document.createElement('span');
+              bonus.className = 'bonus';
+              bonus.textContent = ` · ${stone.bonus}`;
+              desc.append(bonus);
+            }
+            line.append(desc);
+          }
+          stonesList.append(line);
         }
-        if (!record.stones.total) stonesList.textContent = 'Nenhuma pedra encaixada detectada.';
-      } else stonesList.textContent = 'Pedras não identificadas.';
+        if (!record.stones.total) stonesList.textContent = 'Nenhuma pedra encaixada.';
+      } else stonesList.textContent = 'Sem dados das pedras.';
 
       const items = el('items');
       items.replaceChildren();
@@ -687,7 +710,7 @@
       setText('sourceBreakdown', sources
         ? `Origem: Inventário (${ITEMS.map((i) => sources.bag[i.key]).join('/')}) · Banco (${ITEMS.map((i) => sources.bank[i.key]).join('/')}) · Cartas (${ITEMS.map((i) => sources.cards[i.key]).join('/')}) — ordem Arma/Armadura/Artefato`
         : 'Origem: não disponível para esta análise');
-      setText('reason', record.reason);
+      setText('reason', record.status === 'pass' ? '' : record.reason);
       const values = Object.values(getSaved());
       setText('saved', `${values.length} conta(s) verificadas · ${values.filter((v) => v.status === 'pass').length} aprovada(s)`);
       const estimated = estimate(record, values);
